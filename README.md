@@ -1,19 +1,14 @@
 # Predictive Risk Model for Software Delivery
 
-Python project that mines a software team's Jira changelog history to
-detect delivery-risk patterns and build a simple, explainable
-predictive risk model — inspired by real production work, rebuilt here
-on a **synthetic dataset** so it can be shared publicly without
-exposing any client's real data.
+I built this to answer a question that kept coming up on a team I worked with: which Jira tickets are actually going to blow past their estimate, and can you tell before it happens instead of after.
 
-## What this project does
+It's a synthetic version of a real analysis — same methodology, same kind of findings, just rebuilt on generated data so I can share it without touching a client's actual Jira history.
 
-1. **Generates** a realistic Jira changelog export (`01_generate_data.py`)
-2. **Cleans** the data, fixing realistic data-quality problems (`02_clean_data.py`)
-3. **Analyzes** it to find delay patterns and build a compound-delay
-   formula, then renders a dashboard (`03_analysis_and_dashboard.py`)
+## What it does
 
-Run in order:
+1. `01_generate_data.py` builds a synthetic Jira changelog: 210 tickets, 90 features and 120 bugs, spread across 12 sprints.
+2. `02_clean_data.py` fixes the data-quality problems any real export has.
+3. `03_analysis_and_dashboard.py` finds the delay pattern, fits a formula for it, and renders a dashboard.
 
 ```bash
 pip install pandas numpy matplotlib
@@ -22,112 +17,47 @@ python 02_clean_data.py
 python 03_analysis_and_dashboard.py
 ```
 
-## Dataset
+## The dataset
 
-210 tickets (90 Features + 120 Bugs) across 12 sprints, with columns:
-
-| Column | Description |
+| Column | What it is |
 |---|---|
 | `ticket_id` | Jira key (FEAT-### / BUG-###) |
 | `type` | Feature or Bug |
-| `sprint` | Sprint number (1-12) |
-| `story_points` | Estimation size (1, 2, 3, 5, 8, 13) |
-| `dev_days` | Days spent in development |
-| `testing_days` | Days spent in QA/testing (target variable) |
-| `rejections` | Times QA sent the ticket back to development |
-| `staging_days` | Days stuck in "Pending Staging" (deployment) |
+| `sprint` | Sprint number, 1 through 12 |
+| `story_points` | 1, 2, 3, 5, 8, 13 |
+| `dev_days` | Days in development |
+| `testing_days` | Days in QA — the number I'm trying to explain |
+| `rejections` | Times QA sent it back |
+| `staging_days` | Days stuck waiting for deployment |
 | `assignee` | Developer |
 | `created_date` / `resolved_date` | Timestamps |
 
-## Data cleaning (`02_clean_data.py`)
+## Cleaning it up
 
-Every step is printed to the console with a before/after count so the
-impact is auditable, not just claimed:
+Nothing here is analysis-ready straight out of the export:
 
-1. **Casing standardization** — `type` values normalized to Title Case
-   (`bug` → `Bug`), since different Jira automation rules exported the
-   field inconsistently.
-2. **Duplicate removal** — exact duplicate tickets (double-logged by a
-   simulated webhook sync issue) dropped by `ticket_id` + `sprint` +
-   `story_points`.
-3. **Invalid durations** — negative `dev_days` / `testing_days` values
-   (impossible data-entry errors) are treated as missing, then imputed
-   using the **median for that ticket's story-point tier** — more
-   accurate than a single global median because testing time scales
-   strongly with story points.
-4. **Missing `staging_days`** — imputed with the median staging time
-   **for that ticket's type** (Bug vs Feature), since the two follow
-   slightly different release trains.
-5. **Missing `assignee`** — filled with `"Unassigned"` rather than
-   dropped, since the timing data is still valid for the delay
-   analysis even without a known owner.
-6. **Date sanity check** — confirms `resolved_date` is always after
-   `created_date`; any violation would be dropped (none occurred in
-   this run).
-7. **Derived column** — `total_cycle_days = dev_days + testing_days + staging_days`.
+- `type` had inconsistent casing (`bug` vs `Bug`), normalized to Title Case — otherwise a groupby splits one category into two without telling you.
+- A handful of duplicate rows, from a simulated sync glitch, get dropped.
+- Some `dev_days` / `testing_days` values come in negative, which is obviously wrong. I don't just clamp those to zero — I treat them as missing and fill them with the median for that ticket's story-point tier, since testing time depends heavily on ticket size.
+- Missing `staging_days` gets filled with the median for that ticket type (bugs and features move through slightly different release paths).
+- Missing `assignee` becomes `"Unassigned"` instead of getting dropped. The timing data is still useful even without knowing who worked it.
+- Quick sanity check that `resolved_date` never lands before `created_date`.
 
-## Analysis & metrics (`03_analysis_and_dashboard.py`)
+## What the analysis found
 
-### 1. "Sweet Spot of Risk" — story points vs. testing time
+5-point tickets take about a third longer in testing than 8-point tickets. That's backwards — bigger tickets should take longer, not less. Digging into why, it turns out 5-point tickets skip an intermediate code review step that larger tickets go through automatically. A single blended "average testing time" would never surface this; it only shows up once you split by story points.
 
-Groups tickets by `story_points` and compares average `testing_days`.
-5-point tickets take **~30-35% longer in testing** than 8-point
-tickets on average — a real anomaly this simulates: in the underlying
-workflow, 5-point tickets skip an intermediate code-review step that
-larger tickets go through by default, so defects surface later, during QA.
-
-### 2. Compound Delay Formula
-
-The core empirical relationship the analysis is built around:
+From there I fit a regression (testing_days on ticket size and rejections, with an interaction term, solved with `numpy.linalg.lstsq` — no sklearn, so the math stays visible) to turn "rejections cause delays" into something a team can actually plan around:
 
 ```
 Total Time in Testing ≈ Base Testing Time × (1 + 0.8 × Rejections)
 ```
 
-This is **not assumed** — it's recovered directly from the data using
-an OLS regression with an interaction term:
-
-```
-testing_days ~ intercept + b1·base_component + b2·rejections + b3·(base_component × rejections)
-```
-
-solved via `numpy.linalg.lstsq` (normal equations) on:
-
-```python
-X = [1, base_component, rejections, base_component * rejections]
-y = testing_days
-```
-
-The fitted interaction coefficient (`b3`) lands close to **0.8**,
-confirming each additional rejection scales the base testing time by
-roughly that factor. The marginal cost of one extra rejection is then
-computed properly as `b2 + b3 × mean(base_component)` — the correct
-way to read a marginal effect out of an interaction model, rather than
-a naive `(testing_days - base) / rejections` quotient, which would
-double-count the multiplicative term.
-
-### 3. Staging (deployment) bottleneck
-
-Tickets with `staging_days` above the **90th percentile** are flagged
-as stuck in the "Pending Staging" bottleneck — about 10% of tickets in
-this run.
-
-### 4. Risk alert rule
-
-Any ticket with **more than 2 QA rejections** is flagged `high_risk`
-— this mirrors the automated Jira Rovo trigger from the original
-production version of this workflow: proactively alerting tech leads
-before a delay lands, using JQL to scan the backlog in real time
-during sprint planning.
+The interaction coefficient lands close to 0.8, confirming each rejection isn't adding a fixed chunk of time, it's multiplying the base time. Anything stuck above the 90th percentile in `staging_days` gets flagged as a deployment bottleneck (about 1 in 10 tickets), and anything with more than 2 rejections gets a `high_risk` flag — simple enough that a tech lead can act on it in a planning meeting without needing to trust a black box.
 
 ## Dashboard
 
-`dashboard/jira_risk_dashboard.png` — 4 panels:
-
-1. Average testing time by story-point tier (anomaly highlighted)
-2. Rejections vs. testing time scatter + trend line (compound delay)
-3. Staging-days distribution with the 90th-percentile bottleneck line
-4. KPI summary panel (totals, risk %, bottleneck %, formula outputs)
+`dashboard/jira_risk_dashboard.png`, four panels: testing time by story-point tier, rejections vs. testing time with the trend line, the staging bottleneck distribution, and a KPI summary.
 
 ## Files
 
@@ -146,8 +76,6 @@ project1_jira_risk_model/
 └── README.md
 ```
 
-## Disclaimer
+## A note on the data
 
-All data in this project is synthetically generated (`numpy` random
-generator, fixed seed for reproducibility) to demonstrate the analysis
-methodology. No real company, team, or individual's data is used.
+Everything here is generated with numpy, fixed seed, so it's reproducible. No real company's data is in this repo.
